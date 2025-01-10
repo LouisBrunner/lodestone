@@ -1,21 +1,21 @@
 use failure::Error;
 use select::document::Document;
-use select::predicate::Class;
+use select::predicate::{Class, Predicate};
 
-use crate::CLIENT;
-use crate::model::profile::Profile;
 use crate::model::datacenter::Datacenter;
+use crate::model::domain::Domain;
 use crate::model::gc::GrandCompany;
 use crate::model::language::Language;
+use crate::model::profile::{LightProfile, Profile};
 use crate::model::server::Server;
+use crate::CLIENT;
 
-use std::fmt::Write;
 use std::collections::HashSet;
-
-static BASE_SEARCH_URL: &str = "https://na.finalfantasyxiv.com/lodestone/character/?";
+use std::fmt::Write;
 
 #[derive(Clone, Debug, Default)]
 pub struct SearchBuilder {
+    domain: Option<Domain>,
     server: Option<Server>,
     datacenter: Option<Datacenter>,
     character: Option<String>,
@@ -26,14 +26,17 @@ pub struct SearchBuilder {
 impl SearchBuilder {
     pub fn new() -> Self {
         SearchBuilder {
-            .. Default::default()
+            ..Default::default()
         }
     }
 
     /// Builds the search and executes it, returning a list of profiles
     /// that match the given criteria.
-    pub fn send(self) -> Result<Vec<Profile>, Error> {
-        let mut url = BASE_SEARCH_URL.to_owned();
+    fn send_common(self) -> Result<Document, Error> {
+        let mut url = format!(
+            "https://{}.finalfantasyxiv.com/lodestone/character/?",
+            self.domain.unwrap_or(Domain::NorthAmerica).to_string()
+        );
 
         if let Some(name) = self.character {
             let _ = write!(url, "q={}&", name);
@@ -56,7 +59,7 @@ impl SearchBuilder {
             };
         });
 
-        self.gc.iter().for_each(|gc| {        
+        self.gc.iter().for_each(|gc| {
             let _ = match gc {
                 GrandCompany::Unaffiliated => write!(url, "gcid=0&"),
                 GrandCompany::Maelstrom => write!(url, "gcid=1&"),
@@ -71,23 +74,57 @@ impl SearchBuilder {
         let text = response.text()?;
         let doc = Document::from(text.as_str());
 
-        Ok(doc.find(Class("entry__link"))
-            .filter_map(|node| node
-                .attr("href")
-                .and_then(|text| {
-                    let digits = text.chars()
-                        .skip_while(|ch| !ch.is_digit(10))
-                        .take_while(|ch| ch.is_digit(10))
-                        .collect::<String>();
-                    
-                    digits.parse::<u32>().ok()
-                })
-                .and_then(|id| {
-                    let profile = Profile::get(id);
+        Ok(doc)
+    }
 
-                    profile.ok()
-                }))
+    /// Builds the search and executes it, returning a list of profiles
+    /// that match the given criteria.
+    pub fn send(self) -> Result<Vec<Profile>, Error> {
+        Ok(self
+            .send_common()?
+            .find(Class("entry__link"))
+            .filter_map(|node| {
+                node.attr("href")
+                    .and_then(|text| {
+                        let digits = text
+                            .chars()
+                            .skip_while(|ch| !ch.is_digit(10))
+                            .take_while(|ch| ch.is_digit(10))
+                            .collect::<String>();
+
+                        digits.parse::<u32>().ok()
+                    })
+                    .and_then(|id| {
+                        let profile = Profile::get(id);
+
+                        profile.ok()
+                    })
+            })
             .collect())
+    }
+
+    /// Builds the search and executes it, returning a list of profiles
+    /// that match the given criteria.
+    pub fn send_light(self) -> Result<Vec<LightProfile>, Error> {
+        Ok(self
+            .send_common()?
+            .find(Class("ldst__main").descendant(Class("entry")))
+            .filter_map(|node| match LightProfile::create_from(&node) {
+                Ok(profile) => Some(profile),
+                Err(e) => {
+                    println!("{:?}", node);
+                    println!("{:?}", e);
+                    None
+                }
+            })
+            .collect())
+    }
+
+    /// Sets the domain to search in. This can only be called once,
+    /// and any further calls will simply overwrite the previous domain.
+    pub fn domain(mut self, domain: Domain) -> Self {
+        self.domain = Some(domain);
+        self
     }
 
     /// A character name to search for. This can only be called once,
